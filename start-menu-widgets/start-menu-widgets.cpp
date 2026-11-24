@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              start-menu-widgets
-// @name            Start Menu Widgets
+// @id              start-menu-widgets-fork
+// @name            Start Menu Widgets - Fork
 // @description     One mod for the whole custom Start menu: profile, music, weather, system stats (NET/RAM/CPU/GPU), clock, stopwatch, timer and quick launch tiles
 // @version         0.3
 // @author          you
@@ -58,6 +58,11 @@ The mod loads into two processes:
 #include <windows.h>
 #undef GetCurrentTime
 
+
+#include <winstring.h>
+#include <inspectable.h>
+
+
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <dxgi.h>
@@ -87,6 +92,10 @@ The mod loads into two processes:
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
+
+#include <winrt/Windows.Security.Cryptography.h>
+#include <winrt/Windows.UI.Text.h>
+#include <winrt/Windows.UI.Xaml.Documents.h>
 
 #include <mmsystem.h>
 #include <tlhelp32.h>
@@ -126,7 +135,7 @@ using namespace winrt::Windows::ApplicationModel::Core;
 
 // ---------- Layout ----------
 static const double kTile = 152, kGap = 20;
-static const int kCols = 4, kRows = 3;
+static const int kCols = 4, kRows = 4;
 static const wchar_t* kRootName = L"WH_WidgetsRoot";
 static const wchar_t* kNs = L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"";
 
@@ -3210,6 +3219,2022 @@ static void Stop() {
 
 }  // namespace weatherw
 
+
+// ===========================================================================
+// Card host: shows a REAL Windows widget (Phone Link by default) inside a tile.
+// The mod registers as a widget host with the Windows widget service, creates the
+// widget, reads its Adaptive Card template + data, expands the template and draws
+// the card. Nothing about the Phone Link layout is hand-built: change kDefinitionId
+// to show any other widget (ids are listed by the widget-host-probe mod).
+// ===========================================================================
+
+namespace cardhost {
+
+using namespace winrt::Windows::Data::Json;
+using namespace winrt::Windows::Foundation;
+using namespace winrt::Windows::Storage::Streams;
+using namespace winrt::Windows::UI::Xaml::Media;
+using namespace winrt::Windows::UI::Xaml::Media::Imaging;
+using winrt::Windows::Security::Cryptography::CryptographicBuffer;
+
+// the Foundation using-directive also exposes winrt's IUnknown/IInspectable, so name the COM ones explicitly
+using ComUnknown = ::IUnknown;
+using ComInspectable = ::IInspectable;
+
+// ---- which widget to show ----
+static const wchar_t* kHostId = L"6E1F3B52-7A0D-4B8C-9C3E-5D2A8F4B1C70";   // identifies this mod to the widget service
+static const wchar_t* kCustomizeVerb = L"widgetmod:customize";   // internal marker for the pencil button
+
+// ---- ids from Microsoft.Windows.Widgets.winmd / the Widgets Platform Runtime manifest ----
+static const GUID kIidIUnknown = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kIidIInspectable = {0xAF86E2E0, 0xB12D, 0x4C6A, {0x9C, 0x5A, 0xD7, 0xAA, 0x65, 0x10, 0x1E, 0x90}};
+static const GUID kIidAsyncInfo = {0x00000036, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kClsidHostMgr = {0x297FDBDE, 0x595D, 0x4083, {0x82, 0xB1, 0x76, 0x8B, 0xEE, 0x65, 0xF6, 0xC9}};
+static const GUID kIidHost = {0x0EC56173, 0xFD86, 0x474F, {0xA1, 0xA0, 0x08, 0x3E, 0xD2, 0x26, 0x86, 0x57}};
+static const GUID kIidHostContext = {0x36617BAA, 0xEDDE, 0x5EB0, {0x9E, 0x3C, 0x5B, 0xCE, 0x4F, 0xDD, 0xD3, 0x7A}};
+static const GUID kClsidCatalog = {0x3E11DF0F, 0x42EB, 0x4747, {0x9A, 0x35, 0x80, 0x2D, 0x98, 0xB5, 0xBC, 0xF0}};
+static const GUID kIidWidgetDefinition2 = {0x13EC5965, 0xBECB, 0x57DE, {0xBF, 0x5A, 0xFD, 0x9B, 0x1C, 0xD4, 0xB6, 0x85}};
+static const GUID kIidWidget2 = {0x8280D0EA, 0xD8A5, 0x5938, {0xA1, 0x56, 0xCA, 0x37, 0xFB, 0x59, 0x21, 0xAC}};
+
+// ---- hand-written ABI (vtable order = metadata order in the winmd) ----
+struct IWidgetProviderDefinitionABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DisplayName(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Icon(void** value) = 0;
+};
+struct IWidgetCapabilityABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Size(INT32* value) = 0;   // 0 small, 1 medium, 2 large
+};
+struct IWidgetDefinitionABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ProviderDefinition(IWidgetProviderDefinitionABI** value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DisplayTitle(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Description(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_AllowMultiple(unsigned char* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWidgetCapabilities(UINT32* count, IWidgetCapabilityABI*** items) = 0;
+};
+struct IWidgetCatalogABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE GetWidgetDefinitions(UINT32* count, void*** items) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetProviderDefinitions(UINT32* count, void*** items) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWidgetDefinition(HSTRING id, IWidgetDefinitionABI** value) = 0;
+};
+struct IWidgetDefinition2ABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_AdditionalInfoUri(void** value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsCustomizable(unsigned char* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Type(INT32* value) = 0;   // 0 native card, 1 web based
+};
+struct IWidget2ABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE NotifyCustomizationRequestedAsync(void** op) = 0;
+};
+struct IWidgetABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DefinitionId(HSTRING* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_TemplateLastUpdated(INT64* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DataLastUpdated(INT64* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCardTemplateAsync(void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCardDataAsync(void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCustomStateAsync(void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetSizeAsync(void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE NotifyActionInvokedAsync(HSTRING verb, HSTRING data, void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE DeleteAsync(void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetCustomStateAsync(HSTRING state, void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetSizeAsync(INT32 size, void** op) = 0;
+};
+struct IWidgetHostContextABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING* value) = 0;
+};
+struct IWidgetHostABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_HostContext(IWidgetHostContextABI** value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_HostContext(IWidgetHostContextABI* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateWidgetAsync(HSTRING id, INT32 size, void** op) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWidget(HSTRING id, IWidgetABI** value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWidgets(UINT32* count, IWidgetABI*** items) = 0;
+};
+struct IAsyncInfoABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Id(UINT32* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Status(INT32* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ErrorCode(HRESULT* value) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Cancel() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Close() = 0;
+};
+struct IAsyncOpABI : ComInspectable {   // IAsyncOperation<T>: put_Completed, get_Completed, GetResults
+    virtual HRESULT STDMETHODCALLTYPE put_Completed(void* handler) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Completed(void** handler) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetResults(void* result) = 0;
+};
+
+// our side of the host registration: an object that tells the service who we are
+struct HostContextObj : IWidgetHostContextABI {
+    volatile LONG ref = 1;
+    HSTRING id = nullptr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (IsEqualGUID(riid, kIidIUnknown) || IsEqualGUID(riid, kIidIInspectable) || IsEqualGUID(riid, kIidHostContext)) {
+            *ppv = static_cast<IWidgetHostContextABI*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG r = (ULONG)InterlockedDecrement(&ref);
+        if (r == 0) {
+            if (id) WindowsDeleteString(id);
+            delete this;
+        }
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG* count, IID** iids) {
+        *count = 1;
+        *iids = (IID*)CoTaskMemAlloc(sizeof(IID));
+        if (!*iids) return E_OUTOFMEMORY;
+        (*iids)[0] = kIidHostContext;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING* name) {
+        const wchar_t* n = L"Microsoft.Windows.Widgets.Hosts.WidgetHostContext";
+        return WindowsCreateString(n, (UINT32)wcslen(n), name);
+    }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(::TrustLevel* level) {
+        *level = ::BaseTrust;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Id(HSTRING* value) { return WindowsDuplicateString(id, value); }
+};
+
+static HSTRING MakeHs(const wchar_t* s) {
+    HSTRING h = nullptr;
+    WindowsCreateString(s, (UINT32)wcslen(s), &h);
+    return h;
+}
+static std::wstring HStr(HSTRING h) {
+    UINT32 n = 0;
+    const wchar_t* p = h ? WindowsGetStringRawBuffer(h, &n) : nullptr;
+    return p ? std::wstring(p, n) : std::wstring();
+}
+
+static void LogChunks(const wchar_t* label, const std::wstring& s) {
+    Wh_Log(L"CardHost: %s (%u chars)", label, (unsigned)s.size());
+    for (size_t i = 0; i < s.size(); i += 700) Wh_Log(L"CardHost:   %s", s.substr(i, 700).c_str());
+}
+
+// ---- card template engine: ${expression}, $data, $when, $index ----
+
+struct Val {
+    enum Kind { Null, Bool, Num, Str, Json };
+    Kind k = Null;
+    bool b = false;
+    double n = 0;
+    std::wstring s;
+    IJsonValue j{nullptr};
+};
+
+struct Scope {
+    IJsonValue root{nullptr};
+    IJsonValue data{nullptr};
+    IJsonValue host{nullptr};   // $host: hostTheme, widgetSize
+    int index = -1;
+};
+
+static std::wstring LowerW(std::wstring s) {
+    for (auto& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+static std::wstring FormatNum(double n) {
+    wchar_t b[64];
+    if (n == std::floor(n) && std::fabs(n) < 1e15) swprintf_s(b, L"%.0f", n);
+    else swprintf_s(b, L"%g", n);
+    return b;
+}
+
+static Val MakeBool(bool v) { Val r; r.k = Val::Bool; r.b = v; return r; }
+static Val MakeNum(double v) { Val r; r.k = Val::Num; r.n = v; return r; }
+static Val MakeStr(const std::wstring& v) { Val r; r.k = Val::Str; r.s = v; return r; }
+
+static Val FromJson(IJsonValue const& v) {
+    Val r;
+    if (!v) return r;
+    switch (v.ValueType()) {
+        case JsonValueType::Boolean: r.k = Val::Bool; r.b = v.GetBoolean(); break;
+        case JsonValueType::Number: r.k = Val::Num; r.n = v.GetNumber(); break;
+        case JsonValueType::String: r.k = Val::Str; r.s = v.GetString().c_str(); break;
+        case JsonValueType::Array:
+        case JsonValueType::Object: r.k = Val::Json; r.j = v; break;
+        default: break;
+    }
+    return r;
+}
+
+static IJsonValue ToJson(Val const& v) {
+    switch (v.k) {
+        case Val::Bool: return JsonValue::CreateBooleanValue(v.b);
+        case Val::Num: return JsonValue::CreateNumberValue(v.n);
+        case Val::Str: return JsonValue::CreateStringValue(winrt::hstring(v.s));
+        case Val::Json: return v.j;
+        default: return JsonValue::CreateNullValue();
+    }
+}
+
+static bool Truthy(Val const& v) {
+    switch (v.k) {
+        case Val::Bool: return v.b;
+        case Val::Num: return v.n != 0;
+        case Val::Str: return !v.s.empty() && LowerW(v.s) != L"false";
+        case Val::Json: return true;
+        default: return false;
+    }
+}
+
+static std::wstring ToStr(Val const& v) {
+    switch (v.k) {
+        case Val::Bool: return v.b ? L"true" : L"false";
+        case Val::Num: return FormatNum(v.n);
+        case Val::Str: return v.s;
+        case Val::Json: return v.j ? std::wstring(v.j.Stringify().c_str()) : std::wstring();
+        default: return L"";
+    }
+}
+
+static double ToNum(Val const& v) {
+    switch (v.k) {
+        case Val::Num: return v.n;
+        case Val::Bool: return v.b ? 1 : 0;
+        case Val::Str: return wcstod(v.s.c_str(), nullptr);
+        default: return 0;
+    }
+}
+
+static bool ValEq(Val const& a, Val const& b) {
+    if (a.k == Val::Null || b.k == Val::Null) return a.k == b.k;
+    if (a.k == Val::Num && b.k == Val::Num) return a.n == b.n;
+    if (a.k == Val::Bool && b.k == Val::Bool) return a.b == b.b;
+    return ToStr(a) == ToStr(b);
+}
+
+static Val Prop(Val const& base, const std::wstring& name) {
+    if (base.k != Val::Json || !base.j) return Val{};
+    try {
+        if (base.j.ValueType() == JsonValueType::Object) {
+            JsonObject o = base.j.GetObject();
+            if (o.HasKey(winrt::hstring(name))) return FromJson(o.GetNamedValue(winrt::hstring(name)));
+            std::wstring ln = LowerW(name);   // widget templates and data often differ in letter case
+            for (auto const& kv : o) {
+                if (LowerW(std::wstring(kv.Key().c_str())) == ln) return FromJson(kv.Value());
+            }
+        } else if (base.j.ValueType() == JsonValueType::Array && name == L"length") {
+            return MakeNum((double)base.j.GetArray().Size());
+        }
+    } catch (...) {
+    }
+    return Val{};
+}
+
+static Val IndexVal(Val const& base, Val const& idx) {
+    if (base.k != Val::Json || !base.j) return Val{};
+    try {
+        if (base.j.ValueType() == JsonValueType::Array && idx.k == Val::Num) {
+            JsonArray a = base.j.GetArray();
+            int i = (int)idx.n;
+            if (i >= 0 && i < (int)a.Size()) return FromJson(a.GetAt((uint32_t)i));
+        } else if (base.j.ValueType() == JsonValueType::Object) {
+            return Prop(base, ToStr(idx));
+        }
+    } catch (...) {
+    }
+    return Val{};
+}
+
+static Val ResolveIdent(const std::wstring& n, Scope const& sc) {
+    if (n == L"$root") return FromJson(sc.root);
+    if (n == L"$host") return FromJson(sc.host);
+    if (n == L"$data") return FromJson(sc.data);
+    if (n == L"$index") return MakeNum(sc.index);
+    Val d = Prop(FromJson(sc.data), n);
+    if (d.k != Val::Null) return d;
+    return Prop(FromJson(sc.root), n);
+}
+
+static Val CallFn(const std::wstring& nameIn, std::vector<Val> const& a) {
+    std::wstring n = LowerW(nameIn);
+    auto arg = [&](size_t i) -> Val { return i < a.size() ? a[i] : Val{}; };
+    if (n == L"if") return Truthy(arg(0)) ? arg(1) : arg(2);
+    if (n == L"equals") return MakeBool(ValEq(arg(0), arg(1)));
+    if (n == L"not") return MakeBool(!Truthy(arg(0)));
+    if (n == L"and") {
+        for (auto const& v : a) if (!Truthy(v)) return MakeBool(false);
+        return MakeBool(true);
+    }
+    if (n == L"or") {
+        for (auto const& v : a) if (Truthy(v)) return MakeBool(true);
+        return MakeBool(false);
+    }
+    if (n == L"greater") return MakeBool(ToNum(arg(0)) > ToNum(arg(1)));
+    if (n == L"greaterorequals") return MakeBool(ToNum(arg(0)) >= ToNum(arg(1)));
+    if (n == L"less") return MakeBool(ToNum(arg(0)) < ToNum(arg(1)));
+    if (n == L"lessorequals") return MakeBool(ToNum(arg(0)) <= ToNum(arg(1)));
+    if (n == L"count" || n == L"length") {
+        Val v = arg(0);
+        if (v.k == Val::Json && v.j) {
+            if (v.j.ValueType() == JsonValueType::Array) return MakeNum((double)v.j.GetArray().Size());
+            if (v.j.ValueType() == JsonValueType::Object) return MakeNum((double)v.j.GetObject().Size());
+        }
+        if (v.k == Val::Str) return MakeNum((double)v.s.size());
+        return MakeNum(0);
+    }
+    if (n == L"string") return MakeStr(ToStr(arg(0)));
+    if (n == L"int") return MakeNum(std::trunc(ToNum(arg(0))));
+    if (n == L"float") return MakeNum(ToNum(arg(0)));
+    if (n == L"bool") return MakeBool(Truthy(arg(0)));
+    if (n == L"empty") return MakeBool(!Truthy(arg(0)));
+    if (n == L"exists") return MakeBool(arg(0).k != Val::Null);
+    if (n == L"toupper") {
+        std::wstring s = ToStr(arg(0));
+        for (auto& c : s) c = (wchar_t)towupper(c);
+        return MakeStr(s);
+    }
+    if (n == L"tolower") return MakeStr(LowerW(ToStr(arg(0))));
+    if (n == L"trim") {
+        std::wstring s = ToStr(arg(0));
+        size_t b = 0, e = s.size();
+        while (b < e && iswspace(s[b])) b++;
+        while (e > b && iswspace(s[e - 1])) e--;
+        return MakeStr(s.substr(b, e - b));
+    }
+    if (n == L"concat") {
+        std::wstring s;
+        for (auto const& v : a) s += ToStr(v);
+        return MakeStr(s);
+    }
+    if (n == L"substring") {
+        std::wstring s = ToStr(arg(0));
+        int st = (int)ToNum(arg(1));
+        int len = a.size() > 2 ? (int)ToNum(arg(2)) : (int)s.size();
+        if (st < 0) st = 0;
+        if (st > (int)s.size()) st = (int)s.size();
+        if (len < 0) len = 0;
+        return MakeStr(s.substr((size_t)st, (size_t)len));
+    }
+    if (n == L"indexof") {
+        size_t pos = ToStr(arg(0)).find(ToStr(arg(1)));
+        return MakeNum(pos == std::wstring::npos ? -1.0 : (double)pos);
+    }
+    if (n == L"replace") {
+        std::wstring s = ToStr(arg(0)), from = ToStr(arg(1)), to = ToStr(arg(2));
+        if (!from.empty()) {
+            size_t pos = 0;
+            while ((pos = s.find(from, pos)) != std::wstring::npos) {
+                s.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        }
+        return MakeStr(s);
+    }
+    if (n == L"formatnumber") {
+        wchar_t b[64];
+        int dec = (int)ToNum(arg(1));
+        if (dec < 0) dec = 0;
+        if (dec > 10) dec = 10;
+        swprintf_s(b, L"%.*f", dec, ToNum(arg(0)));
+        return MakeStr(b);
+    }
+    if (n == L"formatdatetime") return MakeStr(ToStr(arg(0)));   // not supported: returns the text unchanged
+    if (n == L"json") {
+        std::wstring s = ToStr(arg(0));
+        JsonObject parsed;
+        if (JsonObject::TryParse(winrt::hstring(s), parsed)) return FromJson(parsed);
+        return Val{};
+    }
+    Wh_Log(L"CardHost: unsupported template function %s", nameIn.c_str());
+    return Val{};
+}
+
+struct Parser {
+    const std::wstring& s;
+    Scope const& sc;
+    size_t p = 0;
+    Parser(const std::wstring& str, Scope const& scope) : s(str), sc(scope) {}
+
+    void Ws() { while (p < s.size() && iswspace(s[p])) p++; }
+    bool Take(const wchar_t* t) {
+        Ws();
+        size_t n = wcslen(t);
+        if (s.compare(p, n, t) == 0) {
+            p += n;
+            return true;
+        }
+        return false;
+    }
+    std::wstring Ident() {
+        size_t st = p;
+        while (p < s.size() && (iswalnum(s[p]) || s[p] == L'_' || s[p] == L'$')) p++;
+        return s.substr(st, p - st);
+    }
+
+    Val Expr() { return Ternary(); }
+
+    Val Ternary() {
+        Val c = Or();
+        Ws();
+        if (p < s.size() && s[p] == L'?') {
+            p++;
+            Val a = Ternary();
+            Ws();
+            if (p < s.size() && s[p] == L':') p++;
+            Val b = Ternary();
+            return Truthy(c) ? a : b;
+        }
+        return c;
+    }
+    Val Or() {
+        Val l = And();
+        while (Take(L"||")) {
+            Val r = And();
+            l = MakeBool(Truthy(l) || Truthy(r));
+        }
+        return l;
+    }
+    Val And() {
+        Val l = Eq();
+        while (Take(L"&&")) {
+            Val r = Eq();
+            l = MakeBool(Truthy(l) && Truthy(r));
+        }
+        return l;
+    }
+    Val Eq() {
+        Val l = Rel();
+        for (;;) {
+            if (Take(L"==")) { Val r = Rel(); l = MakeBool(ValEq(l, r)); }
+            else if (Take(L"!=")) { Val r = Rel(); l = MakeBool(!ValEq(l, r)); }
+            else break;
+        }
+        return l;
+    }
+    Val Rel() {
+        Val l = Add();
+        for (;;) {
+            if (Take(L"<=")) { Val r = Add(); l = MakeBool(ToNum(l) <= ToNum(r)); }
+            else if (Take(L">=")) { Val r = Add(); l = MakeBool(ToNum(l) >= ToNum(r)); }
+            else if (Take(L"<")) { Val r = Add(); l = MakeBool(ToNum(l) < ToNum(r)); }
+            else if (Take(L">")) { Val r = Add(); l = MakeBool(ToNum(l) > ToNum(r)); }
+            else break;
+        }
+        return l;
+    }
+    Val Add() {
+        Val l = Mul();
+        for (;;) {
+            if (Take(L"+")) {
+                Val r = Mul();
+                if (l.k == Val::Str || r.k == Val::Str) l = MakeStr(ToStr(l) + ToStr(r));
+                else l = MakeNum(ToNum(l) + ToNum(r));
+            } else if (Take(L"-")) {
+                Val r = Mul();
+                l = MakeNum(ToNum(l) - ToNum(r));
+            } else break;
+        }
+        return l;
+    }
+    Val Mul() {
+        Val l = Unary();
+        for (;;) {
+            if (Take(L"*")) { Val r = Unary(); l = MakeNum(ToNum(l) * ToNum(r)); }
+            else if (Take(L"/")) { Val r = Unary(); double d = ToNum(r); l = MakeNum(d == 0 ? 0 : ToNum(l) / d); }
+            else if (Take(L"%")) { Val r = Unary(); double d = ToNum(r); l = MakeNum(d == 0 ? 0 : std::fmod(ToNum(l), d)); }
+            else break;
+        }
+        return l;
+    }
+    Val Unary() {
+        if (Take(L"!")) return MakeBool(!Truthy(Unary()));
+        if (Take(L"-")) return MakeNum(-ToNum(Unary()));
+        return Postfix();
+    }
+    Val Postfix() {
+        Val v = Primary();
+        for (;;) {
+            Ws();
+            if (p + 1 < s.size() && s[p] == L'.' && (iswalpha(s[p + 1]) || s[p + 1] == L'_' || s[p + 1] == L'$')) {
+                p++;
+                std::wstring id = Ident();
+                v = Prop(v, id);
+            } else if (p < s.size() && s[p] == L'[') {
+                p++;
+                Val i = Expr();
+                Ws();
+                if (p < s.size() && s[p] == L']') p++;
+                v = IndexVal(v, i);
+            } else break;
+        }
+        return v;
+    }
+    Val Primary() {
+        Ws();
+        if (p >= s.size()) return Val{};
+        wchar_t c = s[p];
+        if (c == L'(') {
+            p++;
+            Val v = Expr();
+            Ws();
+            if (p < s.size() && s[p] == L')') p++;
+            return v;
+        }
+        if (c == L'\'' || c == L'"') {
+            wchar_t q = c;
+            p++;
+            std::wstring out;
+            while (p < s.size() && s[p] != q) {
+                if (s[p] == L'\\' && p + 1 < s.size()) p++;
+                out += s[p++];
+            }
+            if (p < s.size()) p++;
+            return MakeStr(out);
+        }
+        if (iswdigit(c)) {
+            wchar_t* end = nullptr;
+            double v = wcstod(s.c_str() + p, &end);
+            p = (size_t)(end - s.c_str());
+            return MakeNum(v);
+        }
+        if (iswalpha(c) || c == L'_' || c == L'$') {
+            std::wstring id = Ident();
+            Ws();
+            if (p < s.size() && s[p] == L'(') {
+                p++;
+                std::vector<Val> args;
+                Ws();
+                if (p < s.size() && s[p] == L')') {
+                    p++;
+                } else {
+                    for (;;) {
+                        args.push_back(Expr());
+                        Ws();
+                        if (p < s.size() && s[p] == L',') { p++; continue; }
+                        if (p < s.size() && s[p] == L')') p++;
+                        break;
+                    }
+                }
+                return CallFn(id, args);
+            }
+            if (id == L"true") return MakeBool(true);
+            if (id == L"false") return MakeBool(false);
+            if (id == L"null") return Val{};
+            return ResolveIdent(id, sc);
+        }
+        p++;   // unknown character: skip it so parsing always makes progress
+        return Val{};
+    }
+};
+
+static Val EvalExpr(const std::wstring& expr, Scope const& sc) {
+    Parser ps(expr, sc);
+    return ps.Expr();
+}
+
+static size_t FindClose(const std::wstring& s, size_t from) {
+    int depth = 1;
+    wchar_t q = 0;
+    for (size_t i = from; i < s.size(); i++) {
+        wchar_t c = s[i];
+        if (q) {
+            if (c == L'\\') i++;
+            else if (c == q) q = 0;
+            continue;
+        }
+        if (c == L'\'' || c == L'"') q = c;
+        else if (c == L'{') depth++;
+        else if (c == L'}') {
+            if (--depth == 0) return i;
+        }
+    }
+    return std::wstring::npos;
+}
+
+// "text ${expr} more" -> string; a string that is exactly one ${expr} keeps the value's type
+static Val Interpolate(const std::wstring& s, Scope const& sc) {
+    if (s.find(L"${") == std::wstring::npos) return MakeStr(s);
+    std::wstring out;
+    size_t i = 0;
+    for (;;) {
+        size_t a = s.find(L"${", i);
+        if (a == std::wstring::npos) {
+            out += s.substr(i);
+            break;
+        }
+        out += s.substr(i, a - i);
+        size_t e = FindClose(s, a + 2);
+        if (e == std::wstring::npos) {
+            out += s.substr(a);
+            break;
+        }
+        Val v = EvalExpr(s.substr(a + 2, e - (a + 2)), sc);
+        if (a == 0 && e + 1 == s.size()) return v;
+        out += ToStr(v);
+        i = e + 1;
+    }
+    return MakeStr(out);
+}
+
+static IJsonValue ExpandValue(IJsonValue const& v, Scope const& sc);
+static IJsonValue ExpandObject(JsonObject const& o, Scope sc, bool applyData);
+
+static void EmitOne(JsonObject const& o, Scope const& sc, JsonArray& out) {
+    if (o.HasKey(L"$when")) {
+        IJsonValue w = ExpandValue(o.GetNamedValue(L"$when"), sc);
+        if (!Truthy(FromJson(w))) return;
+    }
+    IJsonValue e = ExpandObject(o, sc, false);
+    out.Append(e);
+}
+
+static void ExpandArrayItem(IJsonValue const& e, Scope const& sc, JsonArray& out) {
+    if (e.ValueType() != JsonValueType::Object) {
+        IJsonValue x = ExpandValue(e, sc);
+        if (x.ValueType() != JsonValueType::Null) out.Append(x);
+        return;
+    }
+    JsonObject o = e.GetObject();
+    if (!o.HasKey(L"$data")) {
+        EmitOne(o, sc, out);
+        return;
+    }
+    IJsonValue dv = ExpandValue(o.GetNamedValue(L"$data"), sc);
+    if (dv.ValueType() == JsonValueType::Array) {
+        int i = 0;
+        for (auto const& item : dv.GetArray()) {
+            Scope s2 = sc;
+            s2.data = item;
+            s2.index = i++;
+            EmitOne(o, s2, out);
+        }
+    } else if (dv.ValueType() != JsonValueType::Null) {
+        Scope s2 = sc;
+        s2.data = dv;
+        s2.index = -1;
+        EmitOne(o, s2, out);
+    }
+}
+
+static IJsonValue ExpandObject(JsonObject const& o, Scope sc, bool applyData) {
+    if (applyData && o.HasKey(L"$data")) {
+        IJsonValue dv = ExpandValue(o.GetNamedValue(L"$data"), sc);
+        if (dv.ValueType() == JsonValueType::Object) {
+            sc.data = dv;
+            sc.index = -1;
+        }
+    }
+    JsonObject out;
+    for (auto const& kv : o) {
+        winrt::hstring k = kv.Key();
+        if (k == L"$data" || k == L"$when") continue;
+        IJsonValue nv = ExpandValue(kv.Value(), sc);
+        if (nv.ValueType() == JsonValueType::Null) continue;   // unresolved binding: leave the property out
+        out.SetNamedValue(k, nv);
+    }
+    return out;
+}
+
+static IJsonValue ExpandValue(IJsonValue const& v, Scope const& sc) {
+    switch (v.ValueType()) {
+        case JsonValueType::String: return ToJson(Interpolate(std::wstring(v.GetString().c_str()), sc));
+        case JsonValueType::Array: {
+            JsonArray out;
+            for (auto const& e : v.GetArray()) ExpandArrayItem(e, sc, out);
+            return out;
+        }
+        case JsonValueType::Object: return ExpandObject(v.GetObject(), sc, true);
+        default: return v;
+    }
+}
+
+// ---- small JSON accessors used by the renderer ----
+static std::wstring JStr(JsonObject const& o, const wchar_t* k, const wchar_t* def = L"") {
+    if (!o.HasKey(k)) return def;
+    IJsonValue v = o.GetNamedValue(k);
+    switch (v.ValueType()) {
+        case JsonValueType::String: return std::wstring(v.GetString().c_str());
+        case JsonValueType::Number: return FormatNum(v.GetNumber());
+        case JsonValueType::Boolean: return v.GetBoolean() ? L"true" : L"false";
+        default: return def;
+    }
+}
+static bool JBool(JsonObject const& o, const wchar_t* k, bool def) {
+    if (!o.HasKey(k)) return def;
+    IJsonValue v = o.GetNamedValue(k);
+    if (v.ValueType() == JsonValueType::Boolean) return v.GetBoolean();
+    if (v.ValueType() == JsonValueType::String) return LowerW(std::wstring(v.GetString().c_str())) == L"true";
+    return def;
+}
+static double JNum(JsonObject const& o, const wchar_t* k, double def) {
+    if (!o.HasKey(k)) return def;
+    IJsonValue v = o.GetNamedValue(k);
+    if (v.ValueType() == JsonValueType::Number) return v.GetNumber();
+    if (v.ValueType() == JsonValueType::String) return wcstod(v.GetString().c_str(), nullptr);
+    return def;
+}
+static JsonArray JArr(JsonObject const& o, const wchar_t* k) {
+    if (o.HasKey(k) && o.GetNamedValue(k).ValueType() == JsonValueType::Array) return o.GetNamedValue(k).GetArray();
+    return JsonArray();
+}
+
+
+// ---- shared state ----
+
+struct PendingAction {
+    std::wstring verb, data;
+};
+static HANDLE g_stopEvent = nullptr;
+static HANDLE g_catalogThread = nullptr;
+static bool g_debugLog = false;
+
+// ---- talking to the widget service (worker thread, MTA) ----
+
+static HRESULT AwaitAsync(ComUnknown* op, DWORD timeoutMs) {
+    IAsyncInfoABI* info = nullptr;
+    HRESULT hr = op->QueryInterface(kIidAsyncInfo, (void**)&info);
+    if (FAILED(hr) || !info) return FAILED(hr) ? hr : E_NOINTERFACE;
+    ULONGLONG end = GetTickCount64() + timeoutMs;
+    for (;;) {
+        INT32 st = 0;
+        hr = info->get_Status(&st);
+        if (FAILED(hr)) break;
+        if (st != 0) {   // 0 = Started
+            if (st == 1) {
+                hr = S_OK;
+            } else {
+                HRESULT ec = E_FAIL;
+                info->get_ErrorCode(&ec);
+                hr = FAILED(ec) ? ec : E_FAIL;
+            }
+            break;
+        }
+        if (GetTickCount64() > end) {
+            info->Cancel();
+            hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            break;
+        }
+        Sleep(15);
+    }
+    info->Release();
+    return hr;
+}
+
+static IWidgetHostABI* ConnectHost() {
+    ComUnknown* unk = nullptr;
+    HRESULT hr = CoCreateInstance(kClsidHostMgr, nullptr, CLSCTX_LOCAL_SERVER, kIidIUnknown, (void**)&unk);
+    if (FAILED(hr) || !unk) {
+        Wh_Log(L"CardHost: cannot reach the widget service (0x%08X)", (unsigned)hr);
+        return nullptr;
+    }
+    IWidgetHostABI* host = nullptr;
+    hr = unk->QueryInterface(kIidHost, (void**)&host);
+    unk->Release();
+    if (FAILED(hr) || !host) {
+        Wh_Log(L"CardHost: widget host interface not available (0x%08X)", (unsigned)hr);
+        return nullptr;
+    }
+    HostContextObj* ctx = new HostContextObj();
+    WindowsCreateString(kHostId, (UINT32)wcslen(kHostId), &ctx->id);
+    hr = host->put_HostContext(ctx);
+    ctx->Release();   // the service keeps its own reference
+    if (FAILED(hr)) {
+        Wh_Log(L"CardHost: registering as a widget host failed (0x%08X)", (unsigned)hr);
+        host->Release();
+        return nullptr;
+    }
+    Wh_Log(L"CardHost: registered as a widget host");
+    return host;
+}
+
+// reuse the widget this host already owns, otherwise create it
+static IWidgetABI* EnsureWidget(IWidgetHostABI* host, const std::wstring& defId, INT32 size) {
+    IWidgetABI* found = nullptr;
+    UINT32 n = 0;
+    IWidgetABI** ws = nullptr;
+    if (SUCCEEDED(host->GetWidgets(&n, &ws)) && ws) {
+        for (UINT32 i = 0; i < n; i++) {
+            if (!ws[i]) continue;
+            HSTRING def = nullptr;
+            bool match = false;
+            if (SUCCEEDED(ws[i]->get_DefinitionId(&def)) && def) {
+                match = HStr(def) == defId;
+                WindowsDeleteString(def);
+            }
+            if (match && !found) found = ws[i];
+            else ws[i]->Release();
+        }
+        CoTaskMemFree(ws);
+    }
+    if (found) {
+        Wh_Log(L"CardHost: reusing the existing widget");
+        return found;
+    }
+    HSTRING d = MakeHs(defId.c_str());
+    void* op = nullptr;
+    HRESULT hr = host->CreateWidgetAsync(d, size, &op);
+    WindowsDeleteString(d);
+    if (FAILED(hr) || !op) {
+        Wh_Log(L"CardHost: CreateWidgetAsync failed (0x%08X)", (unsigned)hr);
+        return nullptr;
+    }
+    hr = AwaitAsync((ComUnknown*)op, 20000);
+    IWidgetABI* w = nullptr;
+    if (SUCCEEDED(hr)) hr = ((IAsyncOpABI*)op)->GetResults(&w);
+    ((ComUnknown*)op)->Release();
+    if (FAILED(hr) || !w) {
+        Wh_Log(L"CardHost: creating the widget failed (0x%08X)", (unsigned)hr);
+        return nullptr;
+    }
+    Wh_Log(L"CardHost: widget created");
+    return w;
+}
+
+static bool FetchString(IWidgetABI* w, bool wantTemplate, std::wstring& out) {
+    void* op = nullptr;
+    HRESULT hr = wantTemplate ? w->GetCardTemplateAsync(&op) : w->GetCardDataAsync(&op);
+    if (FAILED(hr) || !op) return false;
+    hr = AwaitAsync((ComUnknown*)op, 8000);
+    HSTRING hs = nullptr;
+    if (SUCCEEDED(hr)) hr = ((IAsyncOpABI*)op)->GetResults(&hs);
+    ((ComUnknown*)op)->Release();
+    if (FAILED(hr)) return false;
+    out = HStr(hs);
+    if (hs) WindowsDeleteString(hs);
+    return true;
+}
+
+static void NotifyAction(IWidgetABI* w, const std::wstring& verb, const std::wstring& data) {
+    HSTRING v = MakeHs(verb.c_str());
+    HSTRING d = MakeHs(data.c_str());
+    void* op = nullptr;
+    HRESULT hr = w->NotifyActionInvokedAsync(v, d, &op);
+    WindowsDeleteString(v);
+    WindowsDeleteString(d);
+    if (SUCCEEDED(hr) && op) {
+        AwaitAsync((ComUnknown*)op, 10000);
+        ((ComUnknown*)op)->Release();
+    } else {
+        Wh_Log(L"CardHost: sending the action failed (0x%08X)", (unsigned)hr);
+    }
+}
+
+static IRandomAccessStream CopyStream(IRandomAccessStreamWithContentType const& src) {
+    uint32_t size = (uint32_t)src.Size();
+    DataReader rd(src.GetInputStreamAt(0));
+    rd.LoadAsync(size).get();
+    std::vector<uint8_t> bytes(size);
+    rd.ReadBytes(bytes);
+    InMemoryRandomAccessStream mem;
+    DataWriter w(mem);
+    w.WriteBytes(bytes);
+    w.StoreAsync().get();
+    w.DetachStream();
+    mem.Seek(0);
+    return mem;
+}
+
+// the title, provider icon and "customizable" flag the Widgets Board shows around the card
+static void LoadMeta(const std::wstring& defId, std::wstring& title, IRandomAccessStream& icon, bool& customizable, INT32& sizeMask) {
+    ComUnknown* unk = nullptr;
+    if (FAILED(CoCreateInstance(kClsidCatalog, nullptr, CLSCTX_LOCAL_SERVER, kIidIUnknown, (void**)&unk)) || !unk) return;
+    IWidgetCatalogABI* cat = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(kClsidCatalog, (void**)&cat)) && cat) {
+        HSTRING id = MakeHs(defId.c_str());
+        IWidgetDefinitionABI* d = nullptr;
+        if (SUCCEEDED(cat->GetWidgetDefinition(id, &d)) && d) {
+            HSTRING t = nullptr;
+            if (SUCCEEDED(d->get_DisplayTitle(&t)) && t) {
+                title = HStr(t);
+                WindowsDeleteString(t);
+            }
+            UINT32 cn = 0;
+            IWidgetCapabilityABI** caps = nullptr;
+            if (SUCCEEDED(d->GetWidgetCapabilities(&cn, &caps)) && caps) {
+                for (UINT32 k = 0; k < cn; k++) {
+                    INT32 sz = -1;
+                    if (caps[k] && SUCCEEDED(caps[k]->get_Size(&sz)) && sz >= 0 && sz <= 2) sizeMask |= (1 << sz);
+                    if (caps[k]) caps[k]->Release();
+                }
+                CoTaskMemFree(caps);
+            }
+            IWidgetDefinition2ABI* d2 = nullptr;
+            if (SUCCEEDED(d->QueryInterface(kIidWidgetDefinition2, (void**)&d2)) && d2) {
+                unsigned char c = 0;
+                if (SUCCEEDED(d2->get_IsCustomizable(&c))) customizable = c != 0;
+                d2->Release();
+            }
+            IWidgetProviderDefinitionABI* pd = nullptr;
+            if (SUCCEEDED(d->get_ProviderDefinition(&pd)) && pd) {
+                void* raw = nullptr;
+                if (SUCCEEDED(pd->get_Icon(&raw)) && raw) {
+                    try {
+                        winrt::Windows::Foundation::IUnknown u{raw, winrt::take_ownership_from_abi};
+                        auto ref = u.as<IRandomAccessStreamReference>();
+                        icon = CopyStream(ref.OpenReadAsync().get());
+                    } catch (...) {
+                    }
+                }
+                pd->Release();
+            }
+            d->Release();
+        }
+        WindowsDeleteString(id);
+        cat->Release();
+    }
+    unk->Release();
+}
+
+// the pencil button: asks the widget's provider to open its own settings window
+static void NotifyCustomization(IWidgetABI* w) {
+    IWidget2ABI* w2 = nullptr;
+    if (FAILED(w->QueryInterface(kIidWidget2, (void**)&w2)) || !w2) {
+        Wh_Log(L"CardHost: this widget does not support customization");
+        return;
+    }
+    void* op = nullptr;
+    HRESULT hr = w2->NotifyCustomizationRequestedAsync(&op);
+    if (SUCCEEDED(hr) && op) {
+        AwaitAsync((ComUnknown*)op, 10000);
+        ((ComUnknown*)op)->Release();
+    } else {
+        Wh_Log(L"CardHost: customization request failed (0x%08X)", (unsigned)hr);
+    }
+    w2->Release();
+}
+
+// tells the widget which size it is shown at, so its provider sends the matching layout
+static void SetWidgetSize(IWidgetABI* w, INT32 size) {
+    void* op = nullptr;
+    HRESULT hr = w->SetSizeAsync(size, &op);
+    if (SUCCEEDED(hr) && op) {
+        AwaitAsync((ComUnknown*)op, 10000);
+        ((ComUnknown*)op)->Release();
+        Wh_Log(L"CardHost: widget size set to %d (0 small, 1 medium, 2 large)", (int)size);
+    } else {
+        Wh_Log(L"CardHost: setting the widget size failed (0x%08X)", (unsigned)hr);
+    }
+}
+
+// the requested size, or the nearest size the widget supports
+static int PickSize(int want, INT32 mask) {
+    if (mask == 0 || (mask & (1 << want))) return want;
+    for (int s = want - 1; s >= 0; s--) {
+        if (mask & (1 << s)) return s;
+    }
+    for (int s = want + 1; s <= 2; s++) {
+        if (mask & (1 << s)) return s;
+    }
+    return want;
+}
+
+// ---- drawing: Microsoft's native Adaptive Cards renderer (AdaptiveCards.Rendering.Uwp) ----
+// The mod loads Microsoft's two DLLs, creates the renderer on the Start menu's UI thread, hands it the finished
+// card (template already expanded) and puts the XAML control it returns into the tile. Button clicks come back
+// through the renderer's Action event and are forwarded to the widget. Nothing in the card is drawn by this mod.
+
+static const GUID kIidActionHandler = {0x1898AA11, 0xF3A4, 0x5963, {0xB2, 0x72, 0x47, 0x12, 0x3F, 0x69, 0x66, 0xBE}};
+static const GUID kIidAgile = {0x94EA2B94, 0xE9CC, 0x49E0, {0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90}};
+static const GUID kIidCardRenderer = {0xB886401F, 0x4B55, 0x5857, {0xB8, 0xD1, 0x90, 0xAB, 0xC1, 0x8D, 0xE6, 0xEE}};
+static const GUID kIidHostConfigStatics = {0x05D079FC, 0x3C89, 0x58EA, {0xB5, 0x41, 0xA2, 0xD7, 0xD4, 0x83, 0x18, 0xDA}};
+static const GUID kIidActionEventArgs = {0xB4F7436D, 0x1D0A, 0x55AE, {0x80, 0xFF, 0x6C, 0x70, 0x62, 0x00, 0xAF, 0x2A}};
+static const GUID kIidExecuteAction = {0x16FF2257, 0xD886, 0x58AD, {0xAD, 0xAE, 0xDE, 0xFC, 0xFE, 0x30, 0x02, 0x84}};
+static const GUID kIidSubmitAction = {0x54F42ECB, 0xF10C, 0x5AA2, {0xBD, 0x78, 0x9D, 0x6A, 0xBA, 0x2D, 0x73, 0x6F}};
+static const GUID kIidOpenUrlAction = {0xB47A990B, 0x7EA6, 0x54DB, {0x80, 0x96, 0x61, 0x13, 0x4E, 0x92, 0xF4, 0x12}};
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+static const wchar_t* kArch = L"arm64";
+#else
+static const wchar_t* kArch = L"x64";
+#endif
+
+static std::wstring g_libFolder;   // set from the settings in Start()
+static int g_sizeOverride = -1;            // -1 = follow the tile, otherwise from the settings
+
+// ---- hand-written ABI (order = metadata order in the two .winmd files) ----
+struct IActivationFactoryABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE ActivateInstance(ComInspectable** instance) = 0;
+};
+typedef HRESULT(WINAPI* PFN_GetFactory)(HSTRING, IActivationFactoryABI**);
+
+struct IAdaptiveCardRendererABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_ResourceResolvers(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_HostConfig(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_HostConfig(void* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_OverrideStyles(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_OverrideStyles(void* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_FeatureRegistration(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_FeatureRegistration(void* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_OverflowMaxActions(unsigned char* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_OverflowMaxActions(unsigned char v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_OverflowButtonText(HSTRING* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_OverflowButtonText(HSTRING v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_OverflowButtonAccessibilityText(HSTRING* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_OverflowButtonAccessibilityText(HSTRING v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_AddSelectActionMargin(unsigned char* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_AddSelectActionMargin(unsigned char v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetFixedDimensions(UINT32 width, UINT32 height) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResetFixedDimensions() = 0;
+    virtual HRESULT STDMETHODCALLTYPE RenderAdaptiveCard(void* card, void** result) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RenderAdaptiveCardFromJsonString(HSTRING json, void** result) = 0;
+};
+struct IAdaptiveHostConfigStaticsABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE FromJsonString(HSTRING json, void** result) = 0;
+};
+struct IAdaptiveHostConfigParseResultABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_HostConfig(void** v) = 0;
+};
+struct IVectorABI : ComInspectable {   // IVector<T>: GetAt, get_Size
+    virtual HRESULT STDMETHODCALLTYPE GetAt(UINT32 index, void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT32* v) = 0;
+};
+struct IRenderedAdaptiveCardABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_OriginatingCard(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_OriginatingHostConfig(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_FrameworkElement(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_UserInputs(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Errors(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Warnings(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE add_Action(void* handler, INT64* token) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_Action(INT64 token) = 0;
+};
+struct IAdaptiveActionEventArgsABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Action(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Inputs(void** v) = 0;
+};
+struct IAdaptiveActionElementABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_ActionType(INT32* v) = 0;   // 2 Submit, 3 OpenUrl, 5 Execute
+};
+struct IAdaptiveExecuteActionABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_DataJson(void** v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_DataJson(void* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_AssociatedInputs(INT32* v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_AssociatedInputs(INT32 v) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Verb(HSTRING* v) = 0;
+};
+struct IAdaptiveSubmitActionABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_DataJson(void** v) = 0;
+};
+struct IAdaptiveOpenUrlActionABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_Url(void** v) = 0;
+};
+struct IAdaptiveInputsABI : ComInspectable {
+    virtual HRESULT STDMETHODCALLTYPE AsJson(void** v) = 0;
+};
+
+// ---- tiles: every card tile in the grid has its own widget, worker thread and card ----
+
+struct ActionHandler;
+struct CardFrame;
+
+struct Tile : std::enable_shared_from_this<Tile> {
+    std::wstring key;                      // widget id, or a name such as "Phone Link" or "Witals|CPU"
+    // worker side
+    HANDLE thread = nullptr;
+    HANDLE actionEvent = nullptr;
+    std::mutex qLock;
+    std::vector<PendingAction> queue;
+    std::atomic<int> sizeWanted{0};        // 0 small, 1 medium, 2 large: follows the tile's height in cells
+    // UI side (UI thread only)
+    TextBlock title{nullptr}, status{nullptr};
+    Image icon{nullptr};
+    Button edit{nullptr};
+    Border host{nullptr};
+    DWORD owner = 0;
+    bool wired = false;
+    int applied = -1;
+    std::wstring shownCard;
+    std::shared_ptr<CardFrame> latest;     // newest frame that arrived before the tile was on screen
+    IRenderedAdaptiveCardABI* rendered = nullptr;
+    INT64 actionToken = 0;
+    ActionHandler* handler = nullptr;
+};
+
+static std::mutex g_tilesLock;
+static std::vector<std::shared_ptr<Tile>> g_tiles;
+
+static void PostAction(Tile& t, const std::wstring& verb, const std::wstring& data) {
+    {
+        std::lock_guard<std::mutex> l(t.qLock);
+        t.queue.push_back(PendingAction{verb, data});
+    }
+    if (t.actionEvent) SetEvent(t.actionEvent);
+}
+
+// ---- clicks coming back from the renderer (UI thread) ----
+
+static std::wstring MergePayload(IJsonValue const& dv, JsonObject const& inputs) {
+    bool hasInputs = inputs && inputs.Size() > 0;
+    if (dv && dv.ValueType() == JsonValueType::Object) {
+        JsonObject o = JsonObject::Parse(dv.GetObject().Stringify());   // copy, never edit the card
+        if (hasInputs) {
+            for (auto const& kv : inputs) o.SetNamedValue(kv.Key(), kv.Value());
+        }
+        return std::wstring(o.Stringify().c_str());
+    }
+    if (hasInputs) return std::wstring(inputs.Stringify().c_str());
+    if (dv && dv.ValueType() != JsonValueType::Null) return std::wstring(dv.Stringify().c_str());   // e.g. a plain id
+    return L"";
+}
+
+static IJsonValue JsonFromAbi(void* raw) {
+    if (!raw) return nullptr;
+    winrt::Windows::Foundation::IUnknown u{raw, winrt::take_ownership_from_abi};
+    return u.as<IJsonValue>();
+}
+
+static void HandleAction(void* argsRaw, Tile* tile) {
+    try {
+        IAdaptiveActionEventArgsABI* ea = nullptr;
+        if (FAILED(((ComUnknown*)argsRaw)->QueryInterface(kIidActionEventArgs, (void**)&ea)) || !ea) return;
+        void* actRaw = nullptr;
+        void* inRaw = nullptr;
+        ea->get_Action(&actRaw);
+        ea->get_Inputs(&inRaw);
+
+        JsonObject inputs{nullptr};
+        if (inRaw) {
+            IAdaptiveInputsABI* ai = (IAdaptiveInputsABI*)inRaw;
+            void* jraw = nullptr;
+            if (SUCCEEDED(ai->AsJson(&jraw)) && jraw) {
+                winrt::Windows::Foundation::IUnknown u{jraw, winrt::take_ownership_from_abi};
+                inputs = u.as<JsonObject>();
+            }
+            ai->Release();
+        }
+
+        if (actRaw) {
+            IAdaptiveActionElementABI* act = (IAdaptiveActionElementABI*)actRaw;
+            INT32 type = 0;
+            act->get_ActionType(&type);
+            if (type == 5) {   // Action.Execute
+                IAdaptiveExecuteActionABI* ex = nullptr;
+                if (SUCCEEDED(act->QueryInterface(kIidExecuteAction, (void**)&ex)) && ex) {
+                    void* draw = nullptr;
+                    ex->get_DataJson(&draw);
+                    HSTRING verb = nullptr;
+                    ex->get_Verb(&verb);
+                    PostAction(*tile, HStr(verb), MergePayload(JsonFromAbi(draw), inputs));
+                    if (verb) WindowsDeleteString(verb);
+                    ex->Release();
+                }
+            } else if (type == 2) {   // Action.Submit
+                IAdaptiveSubmitActionABI* sb = nullptr;
+                if (SUCCEEDED(act->QueryInterface(kIidSubmitAction, (void**)&sb)) && sb) {
+                    void* draw = nullptr;
+                    sb->get_DataJson(&draw);
+                    PostAction(*tile, L"", MergePayload(JsonFromAbi(draw), inputs));
+                    sb->Release();
+                }
+            } else if (type == 3) {   // Action.OpenUrl
+                IAdaptiveOpenUrlActionABI* ou = nullptr;
+                if (SUCCEEDED(act->QueryInterface(kIidOpenUrlAction, (void**)&ou)) && ou) {
+                    void* uraw = nullptr;
+                    if (SUCCEEDED(ou->get_Url(&uraw)) && uraw) {
+                        winrt::Windows::Foundation::IUnknown u{uraw, winrt::take_ownership_from_abi};
+                        auto uri = u.as<winrt::Windows::Foundation::Uri>();
+                        ShellExecuteW(nullptr, L"open", uri.AbsoluteUri().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    ou->Release();
+                }
+            }
+            act->Release();
+        }
+        ea->Release();
+    } catch (...) {
+    }
+}
+
+struct IActionHandlerABI : ComUnknown {   // TypedEventHandler<RenderedAdaptiveCard, AdaptiveActionEventArgs>
+    virtual HRESULT STDMETHODCALLTYPE Invoke(void* sender, void* args) = 0;
+};
+struct ActionHandler : IActionHandlerABI {
+    volatile LONG ref = 1;
+    Tile* tile;
+    explicit ActionHandler(Tile* t) : tile(t) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (IsEqualGUID(riid, kIidIUnknown) || IsEqualGUID(riid, kIidActionHandler) || IsEqualGUID(riid, kIidAgile)) {
+            *ppv = static_cast<IActionHandlerABI*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG r = (ULONG)InterlockedDecrement(&ref);
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(void*, void* args) {
+        HandleAction(args, tile);
+        return S_OK;
+    }
+};
+
+// ---- loading and creating the renderer (UI thread only) ----
+
+static HMODULE g_hObjectModel = nullptr, g_hRendering = nullptr;
+static IAdaptiveCardRendererABI* g_renderer = nullptr;
+static std::wstring g_rendererError;   // non-empty = setup failed; shown in the tile
+
+static std::wstring HexW(HRESULT hr) {
+    wchar_t b[16];
+    swprintf_s(b, L"0x%08X", (unsigned)hr);
+    return b;
+}
+
+static bool SystemUsesLightTheme() {
+    DWORD v = 0, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) {
+        return v != 0;
+    }
+    return false;
+}
+static const wchar_t* HostThemeName() { return SystemUsesLightTheme() ? L"light" : L"dark"; }
+
+// colors are #AARRGGBB (Adaptive Cards convention); light/dark follows the system setting
+static std::wstring HostConfigJson(bool light) {
+    std::wstring fg = light ? L"#FF1B1B1B" : L"#FFFFFFFF";
+    std::wstring sub = light ? L"#99000000" : L"#C8FFFFFF";
+    std::wstring emph = light ? L"#14000000" : L"#1AFFFFFF";
+    auto set = [&](const wchar_t* style, const std::wstring& bg) {
+        return std::wstring(L"\"") + style + L"\":{\"backgroundColor\":\"" + bg + L"\",\"foregroundColors\":{"
+               L"\"default\":{\"default\":\"" + fg + L"\",\"subtle\":\"" + sub + L"\"},"
+               L"\"dark\":{\"default\":\"#FF000000\",\"subtle\":\"#99000000\"},"
+               L"\"light\":{\"default\":\"#FFFFFFFF\",\"subtle\":\"#CCFFFFFF\"},"
+               L"\"accent\":{\"default\":\"#FF60CDFF\",\"subtle\":\"#FF4CC2FF\"},"
+               L"\"good\":{\"default\":\"#FF6CCB5F\",\"subtle\":\"#FF6CCB5F\"},"
+               L"\"warning\":{\"default\":\"#FFFCE100\",\"subtle\":\"#FFFCE100\"},"
+               L"\"attention\":{\"default\":\"#FFFF99A4\",\"subtle\":\"#FFFF99A4\"}}}";
+    };
+    std::wstring j = L"{\"supportsInteractivity\":true,\"fontFamily\":\"Segoe UI Variable, Segoe UI\","
+                     L"\"fontSizes\":{\"small\":12,\"default\":14,\"medium\":17,\"large\":21,\"extraLarge\":26},"
+                     L"\"spacing\":{\"small\":4,\"default\":8,\"medium\":16,\"large\":24,\"extraLarge\":32,\"padding\":12},"
+                     L"\"separator\":{\"lineThickness\":1,\"lineColor\":\"" + std::wstring(light ? L"#33000000" : L"#33FFFFFF") + L"\"},"
+                     L"\"imageSizes\":{\"small\":32,\"medium\":52,\"large\":100},"
+                     L"\"actions\":{\"maxActions\":5,\"spacing\":\"default\",\"buttonSpacing\":8,\"actionsOrientation\":\"horizontal\","
+                     L"\"actionAlignment\":\"left\",\"showCard\":{\"actionMode\":\"inline\",\"inlineTopMargin\":8}},"
+                     L"\"containerStyles\":{" + set(L"default", L"#00000000") + L"," + set(L"emphasis", emph) + L"," +
+                     set(L"good", L"#336CCB5F") + L"," + set(L"attention", L"#33FF99A4") + L"," +
+                     set(L"warning", L"#33FCE100") + L"," + set(L"accent", L"#334CC2FF") + L"}}";
+    return j;
+}
+
+// "<folder>\<package>\runtimes\win10-<arch>\native\<dll>" (NuGet layout) or "<folder>\<dll>"
+static std::wstring FindLib(const wchar_t* package, const wchar_t* dll) {
+    std::wstring a = g_libFolder + L"\\" + package + L"\\runtimes\\win10-" + kArch + L"\\native\\" + dll;
+    if (GetFileAttributesW(a.c_str()) != INVALID_FILE_ATTRIBUTES) return a;
+    std::wstring b = g_libFolder + L"\\" + dll;
+    if (GetFileAttributesW(b.c_str()) != INVALID_FILE_ATTRIBUTES) return b;
+    return L"";
+}
+
+static bool EnsureRenderer() {
+    if (g_renderer) return true;
+    if (!g_rendererError.empty()) return false;   // already failed once: do not retry on every update
+
+    auto fail = [](const std::wstring& msg) {
+        g_rendererError = msg;
+        Wh_Log(L"CardHost: %s", msg.c_str());
+        return false;
+    };
+
+    std::wstring om = FindLib(L"AdaptiveCards.ObjectModel.Uwp", L"AdaptiveCards.ObjectModel.Uwp.dll");
+    std::wstring rd = FindLib(L"AdaptiveCards.Rendering.Uwp", L"AdaptiveCards.Rendering.Uwp.dll");
+    if (om.empty() || rd.empty()) return fail(L"Adaptive Cards DLLs not found in " + g_libFolder);
+    g_hObjectModel = LoadLibraryExW(om.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!g_hObjectModel) return fail(L"cannot load the ObjectModel dll (error " + std::to_wstring(GetLastError()) + L")");
+    g_hRendering = LoadLibraryExW(rd.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!g_hRendering) return fail(L"cannot load the Rendering dll (error " + std::to_wstring(GetLastError()) + L")");
+
+    auto getFactory = (PFN_GetFactory)GetProcAddress(g_hRendering, "DllGetActivationFactory");
+    if (!getFactory) return fail(L"the Rendering dll has no activation entry point");
+
+    HSTRING cls = MakeHs(L"AdaptiveCards.Rendering.Uwp.AdaptiveCardRenderer");
+    IActivationFactoryABI* af = nullptr;
+    HRESULT hr = getFactory(cls, &af);
+    WindowsDeleteString(cls);
+    if (FAILED(hr) || !af) return fail(L"no factory for the card renderer (" + HexW(hr) + L")");
+    ComInspectable* inst = nullptr;
+    hr = af->ActivateInstance(&inst);
+    af->Release();
+    if (FAILED(hr) || !inst) {
+        return fail(L"cannot create the card renderer (" + HexW(hr) +
+                    L"); 0x8001010E would mean it was created off the UI thread");
+    }
+    hr = inst->QueryInterface(kIidCardRenderer, (void**)&g_renderer);
+    inst->Release();
+    if (FAILED(hr) || !g_renderer) return fail(L"the card renderer does not expose the expected interface");
+
+    // dark / light colors
+    HSTRING hcls = MakeHs(L"AdaptiveCards.Rendering.Uwp.AdaptiveHostConfig");
+    IActivationFactoryABI* haf = nullptr;
+    hr = getFactory(hcls, &haf);
+    WindowsDeleteString(hcls);
+    if (SUCCEEDED(hr) && haf) {
+        IAdaptiveHostConfigStaticsABI* st = nullptr;
+        if (SUCCEEDED(haf->QueryInterface(kIidHostConfigStatics, (void**)&st)) && st) {
+            std::wstring cfg = HostConfigJson(SystemUsesLightTheme());
+            HSTRING hs = MakeHs(cfg.c_str());
+            void* resRaw = nullptr;
+            if (SUCCEEDED(st->FromJsonString(hs, &resRaw)) && resRaw) {
+                IAdaptiveHostConfigParseResultABI* res = (IAdaptiveHostConfigParseResultABI*)resRaw;
+                void* hcRaw = nullptr;
+                if (SUCCEEDED(res->get_HostConfig(&hcRaw)) && hcRaw) {
+                    g_renderer->put_HostConfig(hcRaw);
+                    ((ComUnknown*)hcRaw)->Release();
+                }
+                res->Release();
+            }
+            WindowsDeleteString(hs);
+            st->Release();
+        }
+        haf->Release();
+    }
+    Wh_Log(L"CardHost: card renderer ready (%s)", g_libFolder.c_str());
+    return true;
+}
+
+static void LogCardIssues(IRenderedAdaptiveCardABI* rc) {
+    void* eraw = nullptr;
+    if (SUCCEEDED(rc->get_Errors(&eraw)) && eraw) {
+        IVectorABI* v = (IVectorABI*)eraw;
+        UINT32 n = 0;
+        v->get_Size(&n);
+        if (n > 0) Wh_Log(L"CardHost: the renderer reported %u card error(s)", (unsigned)n);
+        v->Release();
+    }
+    void* wraw = nullptr;
+    if (SUCCEEDED(rc->get_Warnings(&wraw)) && wraw) {
+        IVectorABI* v = (IVectorABI*)wraw;
+        UINT32 n = 0;
+        v->get_Size(&n);
+        if (n > 0) Wh_Log(L"CardHost: the renderer reported %u card warning(s)", (unsigned)n);
+        v->Release();
+    }
+}
+
+// replaces the tile's card with a freshly rendered one
+static bool RenderInto(Tile& t, const std::wstring& json) {
+    if (json == t.shownCard) return true;   // nothing changed
+
+    UINT32 w = (UINT32)t.host.ActualWidth(), h = (UINT32)t.host.ActualHeight();
+    if (w > 0 && h > 0) g_renderer->SetFixedDimensions(w, h);   // lets "height: stretch" know how much room there is
+
+    HSTRING hs = MakeHs(json.c_str());
+    void* rraw = nullptr;
+    HRESULT hr = g_renderer->RenderAdaptiveCardFromJsonString(hs, &rraw);
+    WindowsDeleteString(hs);
+    if (FAILED(hr) || !rraw) {
+        Wh_Log(L"CardHost: rendering the card failed (0x%08X)", (unsigned)hr);
+        return false;
+    }
+    IRenderedAdaptiveCardABI* rc = (IRenderedAdaptiveCardABI*)rraw;
+    LogCardIssues(rc);
+
+    void* feRaw = nullptr;
+    if (FAILED(rc->get_FrameworkElement(&feRaw)) || !feRaw) {
+        Wh_Log(L"CardHost: the renderer returned no control");
+        rc->Release();
+        return false;
+    }
+    winrt::Windows::Foundation::IUnknown u{feRaw, winrt::take_ownership_from_abi};
+    FrameworkElement fe = u.as<FrameworkElement>();
+    t.host.Child(fe);
+
+    INT64 token = 0;
+    rc->add_Action(static_cast<IActionHandlerABI*>(t.handler), &token);
+    if (t.rendered) {   // release the previous card
+        t.rendered->remove_Action(t.actionToken);
+        t.rendered->Release();
+    }
+    t.rendered = rc;
+    t.actionToken = token;
+    t.shownCard = json;
+    return true;
+}
+
+// ---- the widget catalog: everything the Windows widget service offers on this PC ----
+
+struct WidgetInfo {
+    std::wstring id, title, provider;
+    INT32 sizeMask = 0;          // bit 0 small, bit 1 medium, bit 2 large
+    bool customizable = false;
+    INT32 type = 0;              // 0 native card, 1 web based
+};
+static std::mutex g_catLock;
+static std::vector<WidgetInfo> g_catalog;
+static std::atomic<bool> g_catalogReady{false};
+
+// copy of the catalog (for a future "add a widget" picker)
+static std::vector<WidgetInfo> Catalog() {
+    std::lock_guard<std::mutex> l(g_catLock);
+    return g_catalog;
+}
+
+static std::wstring SizesText(INT32 mask) {
+    std::wstring s;
+    if (mask & 1) s += L"S";
+    if (mask & 2) s += L"M";
+    if (mask & 4) s += L"L";
+    return s;
+}
+
+static void ReadDefinition(IWidgetDefinitionABI* d, WidgetInfo& w) {
+    HSTRING h = nullptr;
+    if (SUCCEEDED(d->get_Id(&h)) && h) {
+        w.id = HStr(h);
+        WindowsDeleteString(h);
+    }
+    h = nullptr;
+    if (SUCCEEDED(d->get_DisplayTitle(&h)) && h) {
+        w.title = HStr(h);
+        WindowsDeleteString(h);
+    }
+    IWidgetProviderDefinitionABI* pd = nullptr;
+    if (SUCCEEDED(d->get_ProviderDefinition(&pd)) && pd) {
+        h = nullptr;
+        if (SUCCEEDED(pd->get_DisplayName(&h)) && h) {
+            w.provider = HStr(h);
+            WindowsDeleteString(h);
+        }
+        pd->Release();
+    }
+    UINT32 cn = 0;
+    IWidgetCapabilityABI** caps = nullptr;
+    if (SUCCEEDED(d->GetWidgetCapabilities(&cn, &caps)) && caps) {
+        for (UINT32 k = 0; k < cn; k++) {
+            INT32 sz = -1;
+            if (caps[k] && SUCCEEDED(caps[k]->get_Size(&sz)) && sz >= 0 && sz <= 2) w.sizeMask |= (1 << sz);
+            if (caps[k]) caps[k]->Release();
+        }
+        CoTaskMemFree(caps);
+    }
+    IWidgetDefinition2ABI* d2 = nullptr;
+    if (SUCCEEDED(d->QueryInterface(kIidWidgetDefinition2, (void**)&d2)) && d2) {
+        unsigned char c = 0;
+        if (SUCCEEDED(d2->get_IsCustomizable(&c))) w.customizable = c != 0;
+        INT32 ty = 0;
+        if (SUCCEEDED(d2->get_Type(&ty))) w.type = ty;
+        d2->Release();
+    }
+}
+
+static std::vector<WidgetInfo> ReadCatalog() {
+    std::vector<WidgetInfo> list;
+    ComUnknown* unk = nullptr;
+    if (FAILED(CoCreateInstance(kClsidCatalog, nullptr, CLSCTX_LOCAL_SERVER, kIidIUnknown, (void**)&unk)) || !unk) return list;
+    IWidgetCatalogABI* cat = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(kClsidCatalog, (void**)&cat)) && cat) {
+        UINT32 n = 0;
+        void** items = nullptr;
+        if (SUCCEEDED(cat->GetWidgetDefinitions(&n, &items)) && items) {
+            for (UINT32 i = 0; i < n; i++) {
+                IWidgetDefinitionABI* d = (IWidgetDefinitionABI*)items[i];
+                if (!d) continue;
+                WidgetInfo w;
+                ReadDefinition(d, w);
+                if (!w.id.empty()) list.push_back(w);
+                d->Release();
+            }
+            CoTaskMemFree(items);
+        }
+        cat->Release();
+    }
+    unk->Release();
+    return list;
+}
+
+static std::wstring TrimKey(std::wstring s) {
+    size_t b = 0, e = s.size();
+    while (b < e && iswspace(s[b])) b++;
+    while (e > b && iswspace(s[e - 1])) e--;
+    return s.substr(b, e - b);
+}
+
+// a tile's key can be a widget id, a title ("Phone Link") or "Provider|Title" ("Witals|CPU")
+static bool ResolveWidget(const std::wstring& keyIn, WidgetInfo& out) {
+    std::wstring key = LowerW(TrimKey(keyIn));
+    std::lock_guard<std::mutex> l(g_catLock);
+    for (auto const& w : g_catalog) {
+        if (LowerW(w.id) == key) { out = w; return true; }
+    }
+    size_t bar = key.find(L'|');
+    if (bar != std::wstring::npos) {
+        std::wstring p = TrimKey(key.substr(0, bar)), ti = TrimKey(key.substr(bar + 1));
+        for (auto const& w : g_catalog) {
+            if (LowerW(w.provider) == p && LowerW(w.title) == ti) { out = w; return true; }
+        }
+        return false;
+    }
+    for (auto const& w : g_catalog) {
+        if (LowerW(w.title) == key) { out = w; return true; }
+    }
+    return false;
+}
+
+static void LogCatalog(std::vector<WidgetInfo> const& list) {
+    Wh_Log(L"CardHost: the widget service offers %u widgets. Use any of these as a tile key:", (unsigned)list.size());
+    for (auto const& w : list) {
+        Wh_Log(L"CardHost:   \"%s|%s\"  sizes %s%s%s  id %s", w.provider.c_str(), w.title.c_str(), SizesText(w.sizeMask).c_str(),
+               w.customizable ? L"  (has settings)" : L"", w.type == 1 ? L"  (web based, not supported)" : L"", w.id.c_str());
+    }
+}
+
+static DWORD WINAPI CatalogWorker(LPVOID) {
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    ULONGLONG next = 0;
+    size_t lastCount = (size_t)-1;
+    while (WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= next) {
+            std::vector<WidgetInfo> list = ReadCatalog();
+            if (!list.empty()) {
+                {
+                    std::lock_guard<std::mutex> l(g_catLock);
+                    g_catalog = list;
+                }
+                g_catalogReady = true;
+                if (list.size() != lastCount) LogCatalog(list);   // logged at start and whenever widgets are added or removed
+                lastCount = list.size();
+                next = now + 30000;
+            } else {
+                next = now + 5000;
+            }
+        }
+        WaitForSingleObject(g_stopEvent, 1000);
+    }
+    try {
+        winrt::uninit_apartment();
+    } catch (...) {
+    }
+    return 0;
+}
+
+// ---- hand-over to the UI thread ----
+
+struct CardFrame {
+    std::shared_ptr<Tile> tile;
+    int version = 0;
+    std::wstring title;
+    IRandomAccessStream icon{nullptr};
+    bool customizable = false;
+    bool hasCard = false;
+    std::wstring cardJson;   // the expanded card
+    std::wstring status;
+};
+
+static void ApplyOnUiThread(std::shared_ptr<CardFrame> f) {
+    try {
+        Tile& t = *f->tile;
+        if (!t.wired || t.owner != GetCurrentThreadId()) return;
+        if (!t.host.IsLoaded()) {   // not on screen yet: remember it, it is drawn as soon as the tile loads
+            t.latest = f;
+            return;
+        }
+        if (f->version <= t.applied) return;
+        t.applied = f->version;
+
+        t.title.Text(winrt::hstring(f->title));
+        t.edit.Visibility(f->customizable ? Visibility::Visible : Visibility::Collapsed);
+        if (f->icon) {
+            BitmapImage b;
+            b.SetSourceAsync(f->icon.CloneStream());
+            t.icon.Source(b);
+            t.icon.Visibility(Visibility::Visible);
+        }
+
+        bool drawn = false;
+        std::wstring status = f->status;
+        if (f->hasCard) {
+            if (!EnsureRenderer()) status = g_rendererError;
+            else drawn = RenderInto(t, f->cardJson);
+            if (!drawn && status.empty()) status = L"The card could not be drawn";
+        }
+        if (drawn) {
+            t.status.Visibility(Visibility::Collapsed);
+        } else {
+            t.host.Child(winrt::Windows::UI::Xaml::UIElement{nullptr});
+            t.shownCard.clear();
+            t.status.Text(winrt::hstring(status));
+            t.status.Visibility(Visibility::Visible);
+        }
+    } catch (winrt::hresult_error const& e) {
+        static int shown = 0;
+        if (shown++ < 5) Wh_Log(L"CardHost: updating a tile failed: %s", e.message().c_str());
+    } catch (...) {
+    }
+}
+
+static void DispatchToViews(std::shared_ptr<CardFrame> f) {
+    try {
+        for (auto view : CoreApplication::Views()) {
+            view.Dispatcher().RunAsync(CoreDispatcherPriority::Low, [f] { ApplyOnUiThread(f); });
+        }
+    } catch (...) {
+    }
+}
+
+// compact view of the expanded card for the log (long strings such as images are shortened)
+static void Summarize(IJsonValue const& v, std::wstring& out) {
+    switch (v.ValueType()) {
+        case JsonValueType::String: {
+            std::wstring s = v.GetString().c_str();
+            out += L'"';
+            if (s.size() > 90) {
+                out += s.substr(0, 40);
+                out += L"...[" + std::to_wstring(s.size()) + L" chars]";
+            } else {
+                out += s;
+            }
+            out += L'"';
+            break;
+        }
+        case JsonValueType::Array: {
+            out += L'[';
+            bool f = true;
+            for (auto const& e : v.GetArray()) {
+                if (!f) out += L',';
+                f = false;
+                Summarize(e, out);
+            }
+            out += L']';
+            break;
+        }
+        case JsonValueType::Object: {
+            out += L'{';
+            bool f = true;
+            for (auto const& kv : v.GetObject()) {
+                if (!f) out += L',';
+                f = false;
+                out += L'"';
+                out += kv.Key().c_str();
+                out += L"\":";
+                Summarize(kv.Value(), out);
+            }
+            out += L'}';
+            break;
+        }
+        default: out += std::wstring(v.Stringify().c_str()); break;
+    }
+}
+
+// layout rules so the card matches the tile: the header is drawn over the card, so leave room for it at the
+// top, and in the small layout drop the "fill the rest" placeholders (the Widgets Board has no room for them)
+static void PrepareCard(IJsonValue const& card, int size) {
+    if (card.ValueType() != JsonValueType::Object) return;
+    JsonObject o = card.GetObject();
+    if (!o.HasKey(L"body") || o.GetNamedValue(L"body").ValueType() != JsonValueType::Array) return;
+    JsonArray body = o.GetNamedValue(L"body").GetArray();
+    if (size == 0) {
+        for (int i = (int)body.Size() - 1; i >= 0; i--) {
+            IJsonValue item = body.GetAt((uint32_t)i);
+            if (item.ValueType() != JsonValueType::Object) continue;
+            if (LowerW(JStr(item.GetObject(), L"height")) == L"stretch") body.RemoveAt((uint32_t)i);
+        }
+    }
+    JsonObject spacer;
+    spacer.SetNamedValue(L"type", JsonValue::CreateStringValue(L"TextBlock"));
+    spacer.SetNamedValue(L"text", JsonValue::CreateStringValue(L"\u00A0"));
+    spacer.SetNamedValue(L"size", JsonValue::CreateStringValue(L"Large"));
+    spacer.SetNamedValue(L"spacing", JsonValue::CreateStringValue(L"None"));
+    body.InsertAt(0, spacer);
+}
+
+static std::shared_ptr<CardFrame> BuildFrame(std::shared_ptr<Tile> tile, int version, const std::wstring& title,
+                                             IRandomAccessStream const& icon, bool customizable, int size,
+                                             const std::wstring& tmpl, const std::wstring& data, const std::wstring& status) {
+    auto f = std::make_shared<CardFrame>();
+    f->tile = tile;
+    f->version = version;
+    f->title = title;
+    f->icon = icon;
+    f->customizable = customizable;
+    f->status = status;
+    if (!tmpl.empty()) {
+        try {
+            JsonObject t;
+            if (JsonObject::TryParse(winrt::hstring(tmpl), t)) {
+                JsonObject d;
+                if (data.empty() || !JsonObject::TryParse(winrt::hstring(data), d)) d = JsonObject();
+                JsonObject host;   // what the Widgets Board tells every card about itself
+                host.SetNamedValue(L"hostTheme", JsonValue::CreateStringValue(HostThemeName()));
+                host.SetNamedValue(L"widgetSize", JsonValue::CreateStringValue(size == 0 ? L"small" : size == 1 ? L"medium" : L"large"));
+                Scope sc;
+                sc.root = d;
+                sc.data = d;
+                sc.host = host;
+                IJsonValue card = ExpandValue(t, sc);
+                PrepareCard(card, size);
+                f->cardJson = card.Stringify().c_str();
+                f->hasCard = true;
+                f->status.clear();
+                static std::atomic<int> loggedSummaries{0};
+                if (g_debugLog && loggedSummaries++ < 3) {
+                    std::wstring sm;
+                    Summarize(card, sm);
+                    LogChunks(L"expanded card (long strings shortened)", sm.substr(0, 6000));
+                }
+            } else {
+                Wh_Log(L"CardHost: a card template is not valid JSON");
+            }
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"CardHost: card expansion failed: %s", e.message().c_str());
+        } catch (...) {
+            Wh_Log(L"CardHost: card expansion failed");
+        }
+    }
+    return f;
+}
+
+static DWORD WINAPI TileWorker(LPVOID param) {
+    Tile* tile = (Tile*)param;
+    std::shared_ptr<Tile> self = tile->shared_from_this();
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    {
+        IWidgetHostABI* host = nullptr;
+        IWidgetABI* widget = nullptr;
+        std::wstring defId, title, lastTemplate, lastData, lastStatus;
+        IRandomAccessStream icon{nullptr};
+        bool customizable = false;
+        INT32 sizeMask = 0;
+        int appliedSize = -1;
+        std::wstring status = L"Looking for the widget...";
+        int version = 0;
+        ULONGLONG nextConnect = 0;
+        bool needFrame = true;
+        bool loggedData = false;
+
+        while (WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
+            ULONGLONG now = GetTickCount64();
+
+            if (defId.empty()) {   // which widget is this tile? (an id, or a name from the catalog)
+                WidgetInfo info;
+                if (ResolveWidget(tile->key, info)) {
+                    defId = info.id;
+                    title = info.title;
+                    sizeMask = info.sizeMask;
+                    customizable = info.customizable;
+                    status = L"Connecting to the widget service...";
+                    Wh_Log(L"CardHost: tile \"%s\" shows %s", tile->key.c_str(), defId.c_str());
+                } else {
+                    status = g_catalogReady ? std::wstring(L"Widget not found: ") + tile->key : std::wstring(L"Looking for the widget...");
+                }
+            }
+
+            if (!defId.empty() && !widget && now >= nextConnect) {
+                host = ConnectHost();
+                if (host) widget = EnsureWidget(host, defId, tile->sizeWanted.load());
+                if (widget) {
+                    sizeMask = 0;
+                    appliedSize = -1;
+                    LoadMeta(defId, title, icon, customizable, sizeMask);
+                    status = L"Waiting for the widget...";
+                    lastTemplate.clear();
+                    lastData.clear();
+                    loggedData = false;
+                } else {
+                    if (host) {
+                        host->Release();
+                        host = nullptr;
+                    }
+                    nextConnect = now + 15000;
+                    status = L"Widget service unavailable";
+                }
+            }
+
+            if (widget) {
+                std::vector<PendingAction> acts;
+                {
+                    std::lock_guard<std::mutex> l(tile->qLock);
+                    acts.swap(tile->queue);
+                }
+                for (auto const& a : acts) {
+                    if (a.verb == kCustomizeVerb) NotifyCustomization(widget);
+                    else NotifyAction(widget, a.verb, a.data);
+                }
+
+                int want = PickSize(tile->sizeWanted.load(), sizeMask);
+                if (want != appliedSize) {   // the tile was (re)sized: tell the widget, so it sends that layout
+                    SetWidgetSize(widget, want);
+                    appliedSize = want;
+                    needFrame = true;
+                }
+
+                std::wstring t, d;
+                bool ok = FetchString(widget, true, t) && FetchString(widget, false, d);
+                if (!ok) {
+                    Wh_Log(L"CardHost: lost the widget service for \"%s\", reconnecting", tile->key.c_str());
+                    widget->Release();
+                    widget = nullptr;
+                    if (host) {
+                        host->Release();
+                        host = nullptr;
+                    }
+                    nextConnect = now + 5000;
+                    status = L"Lost the widget service";
+                } else if (t != lastTemplate || d != lastData) {
+                    if (g_debugLog && t != lastTemplate) LogChunks(L"card template", t);
+                    if (g_debugLog && !loggedData && !d.empty()) {
+                        LogChunks(L"card data", d);
+                        loggedData = true;
+                    }
+                    lastTemplate = t;
+                    lastData = d;
+                    needFrame = true;
+                }
+            }
+
+            if (status != lastStatus) {
+                lastStatus = status;
+                needFrame = true;
+            }
+            if (needFrame) {
+                DispatchToViews(BuildFrame(self, ++version, title, icon, customizable, appliedSize >= 0 ? appliedSize : tile->sizeWanted.load(),
+                                           widget ? lastTemplate : std::wstring(), lastData, status));
+                needFrame = false;
+            }
+
+            HANDLE waits[2] = {g_stopEvent, tile->actionEvent};
+            WaitForMultipleObjects(2, waits, FALSE, 1500);   // a click or a resize wakes this up immediately
+        }
+        if (widget) widget->Release();
+        if (host) host->Release();
+    }
+    try {
+        winrt::uninit_apartment();
+    } catch (...) {
+    }
+    return 0;
+}
+
+// called on the UI thread right after a card tile has been created
+static void Wire(FrameworkElement const& r) {
+    std::wstring key = std::wstring(winrt::unbox_value_or<winrt::hstring>(r.Tag(), L"").c_str());
+    auto title = Get<TextBlock>(r, L"CardTitle");
+    auto status = Get<TextBlock>(r, L"CardStatus");
+    auto icon = Get<Image>(r, L"CardIcon");
+    auto edit = Get<Button>(r, L"CardEdit");
+    auto host = Get<Border>(r, L"CardHost");
+    if (key.empty() || !title || !status || !icon || !edit || !host) {
+        Wh_Log(L"CardHost: a card tile without a widget key was ignored");
+        return;
+    }
+
+    std::shared_ptr<Tile> tile;
+    {
+        std::lock_guard<std::mutex> l(g_tilesLock);
+        for (auto& t : g_tiles) {
+            if (t->key == key) {
+                tile = t;
+                break;
+            }
+        }
+    }
+    bool isNew = !tile;
+    if (isNew) {
+        tile = std::make_shared<Tile>();
+        tile->key = key;
+        tile->actionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        tile->handler = new ActionHandler(tile.get());
+    } else if (tile->rendered) {   // the tile was rebuilt: let go of the old card
+        tile->rendered->remove_Action(tile->actionToken);
+        tile->rendered->Release();
+        tile->rendered = nullptr;
+    }
+    tile->shownCard.clear();
+    tile->latest = nullptr;
+    tile->applied = -1;
+    tile->title = title;
+    tile->status = status;
+    tile->icon = icon;
+    tile->edit = edit;
+    tile->host = host;
+    tile->owner = GetCurrentThreadId();
+    tile->wired = true;
+
+    // the tile's height in grid cells decides the layout: 1 row = small, 2 rows = medium, 3 or more = large
+    int rows = Grid::GetRowSpan(r);
+    int want = rows >= 3 ? 2 : rows == 2 ? 1 : 0;
+    if (g_sizeOverride >= 0) want = g_sizeOverride;
+    tile->sizeWanted = want;
+    if (tile->actionEvent) SetEvent(tile->actionEvent);
+
+    edit.Click([tile](auto&&, auto&&) { PostAction(*tile, kCustomizeVerb, L""); });
+    host.Loaded([tile](auto&&, auto&&) {
+        if (tile->latest) {
+            std::shared_ptr<CardFrame> f = tile->latest;
+            tile->latest = nullptr;
+            tile->applied = -1;
+            ApplyOnUiThread(f);
+        }
+    });
+
+    if (isNew) {
+        std::lock_guard<std::mutex> l(g_tilesLock);
+        g_tiles.push_back(tile);
+        tile->thread = CreateThread(nullptr, 0, TileWorker, tile.get(), 0, nullptr);
+    }
+}
+
+// ---- the tile itself: the card fills it, the header (icon, name, settings pencil) sits on top ----
+
+static std::wstring XmlAttr(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) {
+        if (c == L'&') o += L"&amp;";
+        else if (c == L'<') o += L"&lt;";
+        else if (c == L'>') o += L"&gt;";
+        else if (c == L'"') o += L"&quot;";
+        else o += c;
+    }
+    return o;
+}
+
+// key = widget id, title or "Provider|Title" (see the list in the log)
+static std::wstring TileXaml(const wchar_t* key) {
+    return std::wstring(LR"X(<Border Tag=")X") + XmlAttr(key) +
+           LR"X(" CornerRadius="8" Background="#20888888" BorderBrush="#10000000" BorderThickness="1"><Grid><Border Name="CardHost" /><TextBlock Name="CardStatus" Text="Loading..." FontSize="12" Opacity="0.6" TextWrapping="Wrap" TextAlignment="Center" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="12" /><Grid VerticalAlignment="Top" Margin="12,12,12,0" MinHeight="24"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"><Image Name="CardIcon" Width="16" Height="16" Visibility="Collapsed" VerticalAlignment="Center" /><TextBlock Name="CardTitle" Text="" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" /></StackPanel><Button Name="CardEdit" Grid.Column="1" Visibility="Collapsed" Width="24" Height="24" MinWidth="0" MinHeight="0" Padding="0" CornerRadius="4" BorderThickness="0" Background="Transparent" FontFamily="Segoe Fluent Icons" FontSize="12" Content="&#xE70F;" /></Grid></Grid></Border>)X";
+}
+
+// kept so an existing table entry {..., cardhost::PhoneLinkWidget, cardhost::Wire} still works
+static std::wstring PhoneLinkWidget() {
+    return TileXaml(L"Microsoft.YourPhone_8wekyb3d8bbwe!App!!PhoneLinkApp!!PhoneLinkWidget");
+}
+
+// ---- settings (everything machine specific is a setting, with working defaults) ----
+
+static std::wstring ReadSetting(const wchar_t* name, const wchar_t* def) {
+    PCWSTR v = Wh_GetStringSetting(name);
+    std::wstring s = v ? v : L"";
+    if (v) Wh_FreeStringSetting(v);
+    return s.empty() ? std::wstring(def) : s;
+}
+
+static void LoadSettings() {
+    std::wstring mode = LowerW(ReadSetting(L"cardSizeMode", L"auto"));   // auto = follow each tile's size
+    g_sizeOverride = mode == L"large" ? 2 : mode == L"medium" ? 1 : mode == L"small" ? 0 : -1;
+    g_debugLog = LowerW(ReadSetting(L"cardDebugLog", L"off")) == L"on";
+    std::wstring folder = ReadSetting(L"cardLibraryFolder", L"%ProgramData%\\AdaptiveCards");
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD n = ExpandEnvironmentStringsW(folder.c_str(), buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+    g_libFolder = (n > 0 && n < sizeof(buf) / sizeof(buf[0])) ? std::wstring(buf) : folder;
+    while (!g_libFolder.empty() && (g_libFolder.back() == L'\\' || g_libFolder.back() == L'/')) g_libFolder.pop_back();
+}
+
+static bool Start() {
+    LoadSettings();
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_catalogThread = CreateThread(nullptr, 0, CatalogWorker, nullptr, 0, nullptr);
+    return g_stopEvent && g_catalogThread;
+}
+
+static void Stop() {
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    std::vector<std::shared_ptr<Tile>> tiles;
+    {
+        std::lock_guard<std::mutex> l(g_tilesLock);
+        tiles = g_tiles;
+    }
+    for (auto& t : tiles) {
+        if (t->actionEvent) SetEvent(t->actionEvent);
+        if (t->thread) {
+            WaitForSingleObject(t->thread, 5000);
+            CloseHandle(t->thread);
+            t->thread = nullptr;
+        }
+    }
+    if (g_catalogThread) {
+        WaitForSingleObject(g_catalogThread, 5000);
+        CloseHandle(g_catalogThread);
+        g_catalogThread = nullptr;
+    }
+    for (auto& t : tiles) {
+        if (t->actionEvent) {
+            CloseHandle(t->actionEvent);
+            t->actionEvent = nullptr;
+        }
+    }
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
+}
+
+}  // namespace cardhost
+
 // ---------- Widget table: row, column, row span, column span, builder, optional wire-up ----------
 struct Widget {
     int row, col, row_span, col_span;
@@ -3217,10 +5242,18 @@ struct Widget {
     void (*wire)(FrameworkElement const&) = nullptr;   // runs on the UI thread right after the tile is created
 };
 static const Widget kWidgets[] = {
-    {0, 0, 1, 1, ProfileWidget, WireProfile},    {0, 1, 1, 2, MusicWidget, mediaw::Wire},                                            {0, 3, 1, 1, WeatherWidget, weatherw::Wire},
-    {1, 0, 1, 1, NetWidget, sysstats::WireNet},  {1, 1, 1, 1, RamWidget, sysstats::WireRam}, {1, 2, 1, 1, ClockWidget},                  {1, 3, 1, 1, StopwatchWidget, WireStopwatch},
-    {2, 0, 1, 1, CpuWidget, sysstats::WireCpu},  {2, 1, 1, 1, GpuWidget, sysstats::WireGpu}, {2, 2, 1, 1, TimerWidget, WireTimer},      {2, 3, 1, 1, QuickLaunchWidget, WireQuickLaunch},
+    {0, 0, 1, 1, ProfileWidget, WireProfile},       {0, 1, 1, 2, MusicWidget, mediaw::Wire},                                                    {0, 3, 1, 1, WeatherWidget, weatherw::Wire},
+    {1, 0, 1, 1, NetWidget, sysstats::WireNet},     {1, 1, 1, 1, RamWidget, sysstats::WireRam},     {1, 2, 1, 1, ClockWidget},                  {1, 3, 1, 1, StopwatchWidget, WireStopwatch},
+    {2, 0, 1, 1, CpuWidget, sysstats::WireCpu},     {2, 1, 1, 1, GpuWidget, sysstats::WireGpu},     {2, 2, 1, 1, TimerWidget, WireTimer},       {2, 3, 1, 1, QuickLaunchWidget, WireQuickLaunch},
+    {3, 0, 1, 2, cardhost::PhoneLinkWidget, cardhost::Wire},                                        //{3, 2, 3, 2, cardhost::PhoneLinkWidget, cardhost::Wire},
+    //{4, 0, 2, 2, cardhost::PhoneLinkWidget, cardhost::Wire},
 };
+
+// Extra Widgets
+// {0, 1, 1, 2, MusicWidget, mediaw::Wire},
+// {0, 1, 1, 2, cardhost::PhoneLinkWidget, cardhost::Wire},
+
+
 static Grid BuildRoot() {
     Grid g;
     g.Name(kRootName);
@@ -3431,6 +5464,7 @@ BOOL Wh_ModInit() {
     sysstats::Start(true);
     mediaw::Start();
     weatherw::Start();
+    cardhost::Start();
     return TRUE;
 }
 
@@ -3449,6 +5483,7 @@ void Wh_ModUninit() {
     weatherw::Stop();
     mediaw::Stop();
     sysstats::Stop();
+    cardhost::Stop();
     if (g_qlThread.joinable()) g_qlThread.join();
     if (g_thread.joinable()) g_thread.join();
     RestartStartMenu();
