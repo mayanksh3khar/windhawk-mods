@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              start-menu-widgets-fork
-// @name            Start Menu Widgets - Fork
+// @id              start-menu-widgets
+// @name            Start Menu Widgets
 // @description     One mod for the whole custom Start menu: profile, music, weather, system stats (NET/RAM/CPU/GPU), clock, stopwatch, timer and quick launch tiles
 // @version         0.3
 // @author          you
